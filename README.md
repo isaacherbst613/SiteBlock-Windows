@@ -10,6 +10,7 @@ This is a Windows adaptation of **[SiteBlock by nokal123](https://github.com/nok
 
 - **Hosts file:** blocked sites (plus their `www.` and `m.` versions) are pointed at `0.0.0.0` in `C:\Windows\System32\drivers\etc\hosts`. This applies to every browser and app.
 - **Browser policies:** blocked sites go into the block lists that Chrome, Edge, Brave and Firefox enforce themselves. These cover every subdomain and can block part of a site, such as `youtube.com/shorts`. Secure DNS (DNS-over-HTTPS) is turned off in those browsers so they can't skip the hosts file.
+- **Tab watcher:** sites like YouTube switch to `/shorts/...` without loading a page, so the browser never checks its block list. A small task running as the signed-in user watches the address bar of the browser window in front (Chrome, Edge, Brave, Firefox) and reloads it once when it lands on a blocked part, so the block page shows.
 - **Background task:** a scheduled task running as SYSTEM re-applies both every 2 seconds, undoing hand edits, and carries out unblocks when their wait ends. If it is stopped, Windows starts it again within a minute.
 
 ## Install

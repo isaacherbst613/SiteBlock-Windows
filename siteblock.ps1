@@ -11,6 +11,7 @@ $Begin    = '# BEGIN SiteBlock'
 $End      = '# END SiteBlock'
 $Task     = 'SiteBlock'
 $Lnk      = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\SiteBlock.lnk"
+$Paths    = "$Bin\paths.txt"   # blocked site parts, readable by the per-user tab watcher (state.json is admin-only)
 $Chromium = 'HKLM:\SOFTWARE\Policies\Google\Chrome', 'HKLM:\SOFTWARE\Policies\Microsoft\Edge', 'HKLM:\SOFTWARE\Policies\BraveSoftware\Brave'
 $Firefox  = 'HKLM:\SOFTWARE\Policies\Mozilla\Firefox'
 
@@ -81,13 +82,54 @@ function Fix-Policies($sites) {
     Set-Val "$Firefox\DNSOverHTTPS" Locked 1 DWord
 }
 
+# Does a browser address-bar text fall under a site-part rule? Same prefix matching as the browsers' block lists.
+function Match-Tab([string]$url, $rules) {
+    try { $u = Normalize $url } catch { return $false }
+    $h, $p = $u -split '/', 2
+    foreach ($r in $rules) {
+        $rh, $rp = $r -split '/', 2
+        if (($h -eq $rh -or $h.EndsWith(".$rh")) -and $p -and $p.StartsWith($rp)) { return $true }
+    }
+    $false
+}
+
+# Runs as the signed-in user. Sites like YouTube switch to /shorts/... without loading a page, so the
+# browser never checks its block list; reloading the tab once makes it show the block page.
+# ponytail: reads only the foreground browser window's address bar via UI Automation (the first Edit
+# control), so a blocked part playing in a background tab is caught when you switch to it.
+function Watch-Tabs {
+    $one = New-Object Threading.Mutex($false, 'Local\SiteBlockWatch')   # one watcher per sign-in session
+    if (-not $one.WaitOne(0)) { return }
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
+    Add-Type -Name Win -Namespace SiteBlock -MemberDefinition '
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);'
+    $isEdit = New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)
+    $done = @{}   # window -> address already reloaded, so a block page isn't reloaded over and over
+    while (Test-Path $PSCommandPath) {   # exits after uninstall
+        Start-Sleep -Milliseconds 700
+        try {
+            $rules = @(if (Test-Path $Paths) { Get-Content $Paths })
+            if (-not $rules) { $done.Clear(); continue }
+            $w = [SiteBlock.Win]::GetForegroundWindow(); $procId = 0
+            [void][SiteBlock.Win]::GetWindowThreadProcessId($w, [ref]$procId)
+            if ((Get-Process -Id $procId).ProcessName -notin 'chrome', 'msedge', 'brave', 'firefox') { continue }
+            $bar = [Windows.Automation.AutomationElement]::FromHandle($w).FindFirst('Descendants', $isEdit)
+            if (-not $bar -or $bar.Current.HasKeyboardFocus) { continue }   # never reload while you're typing an address
+            $url = $bar.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value
+            if (-not (Match-Tab $url $rules)) { $done.Remove("$w"); continue }
+            if ($done["$w"] -ne $url) { $done["$w"] = $url; [Windows.Forms.SendKeys]::SendWait('{F5}') }
+        } catch {}
+    }
+}
+
 function Remove-All {
     Fix-Hosts @()
     foreach ($k in $Chromium) { Remove-Item "$k\URLBlocklist" -Recurse -ErrorAction SilentlyContinue; Remove-ItemProperty $k DnsOverHttpsMode -ErrorAction SilentlyContinue }
     Remove-Item "$Firefox\WebsiteFilter", "$Firefox\DNSOverHTTPS" -Recurse -ErrorAction SilentlyContinue
     $p = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     [Environment]::SetEnvironmentVariable('Path', (($p -split ';' | Where-Object { $_ -and $_ -ne $Bin }) -join ';'), 'Machine')
-    Unregister-ScheduledTask $Task -Confirm:$false -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask $Task, "$Task Tabs" -Confirm:$false -ErrorAction SilentlyContinue
     Remove-Item $Bin, $Dir, $Lnk -Recurse -Force -ErrorAction SilentlyContinue
 }
 
@@ -178,6 +220,8 @@ function Set-Uninstall($on) {
 
 if ($MyInvocation.InvocationName -eq '.') { return }   # dot-sourced by test.ps1
 
+if ($Cmd -eq 'watch') { Watch-Tabs; return }   # the only command that runs as a normal user
+
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrators')) {
     throw 'Run this from an administrator terminal.'
 }
@@ -198,7 +242,13 @@ switch ($Cmd) {
         $t = @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)))
         $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
         Register-ScheduledTask $Task -Action $a -Trigger $t -Settings $set -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
+        # Tab watcher: runs as whoever signs in (it needs their desktop), back within a minute if closed.
+        $wa = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Bin\siteblock.ps1`" watch"
+        $wt = New-ScheduledTaskTrigger -AtLogOn
+        $wt.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)).Repetition
+        Register-ScheduledTask "$Task Tabs" -Action $wa -Trigger $wt -Settings $set -Principal (New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Users' -RunLevel Limited) -Force | Out-Null
         Stop-ScheduledTask $Task; Start-ScheduledTask $Task
+        Start-ScheduledTask "$Task Tabs"
         Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Bin\siteblock-gui.ps1`""
         'Installed. Open SiteBlock from the Start menu, or use "siteblock" in a NEW admin terminal.'
     }
@@ -224,6 +274,8 @@ switch ($Cmd) {
                 $names = @($s.sites | ForEach-Object { $_.name })
                 Fix-Hosts @(HostNames $names)
                 Fix-Policies $names
+                $p = @($names | Where-Object { $_ -like '*/*' }) -join "`r`n"
+                if (-not (Test-Path $Paths) -or [IO.File]::ReadAllText($Paths) -cne $p) { [IO.File]::WriteAllText($Paths, $p) }
             } catch { Log $_ }
             Start-Sleep 2
         }
